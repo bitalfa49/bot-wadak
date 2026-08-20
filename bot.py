@@ -719,10 +719,7 @@ def build_app():
     return app
 
 
-def main():
-    if not BOT_TOKEN or "حط_توكن" in BOT_TOKEN:
-        raise SystemExit("⚠️ لازم تحط توكن البوت بمتغير BOT_TOKEN")
-
+async def _run_async():
     if USE_DB:
         db_init()
     load_all()
@@ -731,8 +728,35 @@ def main():
     threading.Thread(target=start_web_server, daemon=True).start()
 
     app = build_app()
+    await app.initialize()
+    await app.start()
+    # stop_signals=None يمنع مشاكل معالجة إشارات النظام جوا حاويات مثل Render
+    await app.updater.start_polling(drop_pending_updates=True)
     log.info("🛡️ بوت الحماية شغّال...")
-    app.run_polling(drop_pending_updates=True)
+
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
+
+def main():
+    if not BOT_TOKEN or "حط_توكن" in BOT_TOKEN:
+        raise SystemExit("⚠️ لازم تحط توكن البوت بمتغير BOT_TOKEN")
+
+    # نتأكد إنو في event loop بالخيط الرئيسي (يحل مشكلة نسخ بايثون الجديدة مثل 3.14)
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    try:
+        asyncio.run(_run_async())
+    except (KeyboardInterrupt, SystemExit):
+        pass
 
 
 if __name__ == "__main__":
