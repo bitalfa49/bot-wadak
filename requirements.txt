@@ -1,4 +1,5 @@
-python-telegram-bot==20.7
+Pyrogram==2.0.106
+TgCrypto==1.2.5
 pymongo
 dnspython
 flask
