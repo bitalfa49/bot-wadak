@@ -1,9 +1,16 @@
 import os
 import random
-from threading import Thread
+import asyncio
 from flask import Flask
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
+from threading import Thread
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 from pymongo import MongoClient
 
 # --- سيرفر وهمي لإبقاء Render نشطاً ---
@@ -11,7 +18,7 @@ web_app = Flask('')
 
 @web_app.route('/')
 def home():
-    return "Bot is running 24/7!"
+    return "Bot is active and running!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -19,12 +26,11 @@ def run_web():
 
 def keep_alive():
     t = Thread(target=run_web)
+    t.daemon = True
     t.start()
 
 # --- إعدادات البيئة وقاعدة البيانات ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_ID = int(os.getenv("API_ID", "0"))
-API_HASH = os.getenv("API_HASH")
 MONGO_URL = os.getenv("MONGO_URL")
 
 mongo_client = MongoClient(MONGO_URL)
@@ -32,8 +38,7 @@ db = mongo_client["telegram_bot_db"]
 whitelisted_col = db["whitelisted"]
 admins_col = db["admins"]
 
-app = Client("protection_welcome_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
+# --- الترحيبات العراقية (أكثر من 20 عبارة) ---
 WELCOME_MESSAGES = [
     "هلا والله نورت الجات يا الغالي 🌹✨",
     "يا هلا ويا مرحبا، نورت الجروب بوجودك يا بطل 👋🔥",
@@ -64,53 +69,64 @@ def is_whitelisted(user_id: int) -> bool:
 def is_admin(user_id: int) -> bool:
     return admins_col.find_one({"user_id": user_id}) is not None
 
-@app.on_message(filters.new_chat_members)
-async def welcome_new_member(client, message: Message):
-    for member in message.new_chat_members:
+# --- الترحب بالأعضاء الجدد ---
+async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
         text = random.choice(WELCOME_MESSAGES)
-        full_text = f"👤 {member.mention}\n\n{text}"
+        full_text = f"👤 {member.mention_html()}\n\n{text}"
         buttons = InlineKeyboardMarkup([
             [InlineKeyboardButton("📜 القوانين", callback_data="rules"),
              InlineKeyboardButton("💬 الدعم", callback_data="support")]
         ])
-        await message.reply_text(full_text, reply_markup=buttons)
+        await update.message.reply_html(full_text, reply_markup=buttons)
 
-@app.on_message(filters.group & (filters.regex(r"http[s]?://") | filters.regex(r"t\.me/")))
-async def link_filter(client, message: Message):
-    user_id = message.from_user.id
+# --- حماية الروابط ---
+async def link_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
     if is_whitelisted(user_id) or is_admin(user_id):
         return
     try:
-        await message.delete()
-        await message.reply_text(f"⚠️ {message.from_user.mention}، يمنع إرسال الروابط!")
+        await update.message.delete()
+        await update.message.reply_text(f"⚠️ {update.message.from_user.first_name}، يمنع إرسال الروابط في هذه المجموعة!")
     except Exception:
         pass
 
-@app.on_message(filters.command("control") & filters.group)
-async def control_panel(client, message: Message):
-    if not is_admin(message.from_user.id):
-        return await message.reply_text("❌ هذه اللوحة مخصصة للمشرفين والمالك فقط.")
-    buttons = InlineKeyboardMarkup([
-        [InlineKeyboardButton("ℹ️ البوت يعمل بنجاح", callback_data="info")]
-    ])
-    await message.reply_text("⚙️ **لوحة تحكم البوت جاهزة**", reply_markup=buttons)
-
-@app.on_message(filters.command("allow") & filters.group)
-async def allow_user(client, message: Message):
-    if not is_admin(message.from_user.id):
+# --- إضافة استثناء روابط (بالرد) ---
+async def allow_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.message.from_user.id):
         return
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
+    if update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
         whitelisted_col.update_one({"user_id": target_id}, {"$set": {"user_id": target_id}}, upsert=True)
-        await message.reply_text("✅ تم السماح للمستخدم بنشر الروابط.")
+        await update.message.reply_text("✅ تم السماح للمستخدم بنشر الروابط.")
 
-@app.on_message(filters.command("addadmin") & filters.group)
-async def add_admin_user(client, message: Message):
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
+# --- إضافة أدمن للبوت (بالرد) ---
+async def add_admin_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.reply_to_message:
+        target_id = update.message.reply_to_message.from_user.id
         admins_col.update_one({"user_id": target_id}, {"$set": {"user_id": target_id}}, upsert=True)
-        await message.reply_text("✅ تم إضافة المستخدم كـ آدمن في البوت.")
+        await update.message.reply_text("✅ تم إضافة المستخدم كـ آدمن في البوت.")
 
-if __name__ == "__main__":
+# --- لوحة التحكم ---
+async def control_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.message.from_user.id):
+        return await update.message.reply_text("❌ هذه اللوحة مخصصة للمشرفين والمالك فقط.")
+    buttons = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚙️ البوت يعمل بنجاح والحماية مفعلة", callback_data="status")]
+    ])
+    await update.message.reply_text("🛠️ **لوحة تحكم البوت:**", reply_markup=buttons)
+
+def main():
     keep_alive()
-    app.run()
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
+    application.add_handler(MessageHandler(filters.TEXT & (filters.Regex(r'http[s]?://') | filters.Regex(r't\.me/')), link_filter))
+    application.add_handler(CommandHandler("allow", allow_user))
+    application.add_handler(CommandHandler("addadmin", add_admin_user))
+    application.add_handler(CommandHandler("control", control_panel))
+
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
