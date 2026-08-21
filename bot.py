@@ -34,6 +34,9 @@ from telegram import (
     ChatPermissions,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChatAdministrators,
 )
 from telegram.constants import ParseMode, ChatMemberStatus
 from telegram.ext import (
@@ -80,6 +83,7 @@ DEFAULT_SETTINGS = {
     "flood_limit": 5,       # عدد رسائل
     "flood_window": 4,      # خلال كم ثانية
     "mute_minutes": 15,     # مدة الكتم عند مخالفة
+    "clean_mode": True,     # يمسح أوامر الأدمن وردود البوت من الكروب
 }
 
 
@@ -194,6 +198,30 @@ def esc(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+async def _delete_silent(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def _cleanup_command(context, msg, rec):
+    """يمسح رسالة أمر الأدمن (لو وضع الإخفاء مفعّل)"""
+    if rec["settings"].get("clean_mode", True):
+        await _delete_silent(context.bot, msg.chat_id, msg.message_id)
+
+
+async def _reply_hideable(context, chat_id, rec, text, **kwargs):
+    """يبعت رد، وإذا وضع الإخفاء مفعّل يمسحه بعد كم ثانية"""
+    sent = await context.bot.send_message(chat_id, text, **kwargs)
+    if rec["settings"].get("clean_mode", True):
+        async def _later():
+            await asyncio.sleep(8)
+            await _delete_silent(context.bot, chat_id, sent.message_id)
+        context.application.create_task(_later())
+    return sent
+
+
 # ==================================================================
 #                    فحص الصلاحيات
 # ==================================================================
@@ -237,6 +265,9 @@ def _check_flood(chat_id, user_id, limit, window):
 # ==================================================================
 #                    لوحة التحكم (Inline)
 # ==================================================================
+DEVELOPER = "zyh011"
+
+
 def panel_kb(rec):
     s = rec["settings"]
 
@@ -254,11 +285,18 @@ def panel_kb(rec):
         ],
         [
             InlineKeyboardButton(f"🤖 كابتشا الجدد {dot(s['captcha'])}", callback_data="g_captcha"),
+            InlineKeyboardButton(f"🙈 إخفاء المحادثة {dot(s.get('clean_mode', True))}", callback_data="g_clean"),
         ],
         [
             InlineKeyboardButton(f"⚠️ حد التحذيرات: {s['warn_limit']}", callback_data="g_warnlimit"),
         ],
-        [InlineKeyboardButton("🔄 تحديث", callback_data="g_refresh")],
+        [
+            InlineKeyboardButton("📩 استفسار عن البوت", url=f"https://t.me/{DEVELOPER}"),
+        ],
+        [
+            InlineKeyboardButton("🔄 تحديث", callback_data="g_refresh"),
+            InlineKeyboardButton("✖️ إغلاق", callback_data="g_close"),
+        ],
     ])
 
 
@@ -272,8 +310,10 @@ def panel_text(rec):
         f"🌊 مكافحة السبام: {'مفعّل' if s['anti_spam'] else 'موقوف'}\n"
         f"👋 الترحيب: {'مفعّل' if s['welcome'] else 'موقوف'}\n"
         f"🤖 كابتشا الأعضاء الجدد: {'مفعّل' if s['captcha'] else 'موقوف'}\n"
+        f"🙈 إخفاء محادثة الأدمن: {'مفعّل' if s.get('clean_mode', True) else 'موقوف'}\n"
         f"⚠️ حد التحذيرات قبل الطرد: {s['warn_limit']}\n\n"
-        "بس مشرفين الكروب فيهم يعدّلوا هالإعدادات."
+        "بس مشرفين الكروب فيهم يعدّلوا هالإعدادات.\n"
+        "عندك استفسار؟ اضغط «📩 استفسار عن البوت» تحت."
     )
 
 
@@ -283,52 +323,112 @@ def panel_text(rec):
 PENDING_CAPTCHA = {}   # (chat_id, user_id) -> True
 
 
-async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    if not msg or not msg.new_chat_members:
-        return
-    chat_id = msg.chat_id
+async def _greet_or_captcha(context, chat_id, member):
+    """يرحّب بعضو جديد أو يفعّل الكابتشا له — يُستدعى من ChatMemberHandler (أدق من رسائل الانضمام)"""
     rec = get_chat_rec(chat_id)
     s = rec["settings"]
 
-    for member in msg.new_chat_members:
-        if member.id == context.bot.id:
-            await msg.reply_text(
-                "🛡️ عشت، شكراً عالإضافة!\n"
-                "ارفعني <b>مشرف</b> بصلاحيات (حذف رسائل، حظر أعضاء) عشان أقدر أحميكم فعلياً.\n\n"
-                "اكتب /panel عشان تفتح لوحة الإعدادات.",
-                parse_mode=ParseMode.HTML,
+    if s.get("captcha"):
+        try:
+            await context.bot.restrict_chat_member(
+                chat_id, member.id,
+                permissions=ChatPermissions(can_send_messages=False),
             )
-            continue
-
-        if s.get("captcha"):
-            # نقيّد العضو مؤقتاً لحد ما يضغط الزر
-            try:
-                await context.bot.restrict_chat_member(
-                    chat_id, member.id,
-                    permissions=ChatPermissions(can_send_messages=False),
-                )
-            except Exception:
-                pass
-            PENDING_CAPTCHA[(chat_id, member.id)] = True
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ أنا مش بوت", callback_data=f"cap:{member.id}")
-            ]])
-            sent = await msg.reply_text(
+        except Exception:
+            pass
+        PENDING_CAPTCHA[(chat_id, member.id)] = True
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ أنا مش بوت", callback_data=f"cap:{member.id}")
+        ]])
+        try:
+            sent = await context.bot.send_message(
+                chat_id,
                 f"👋 أهلاً {member.mention_html()}!\nاضغط الزر تحت خلال دقيقتين وإلا رح تنطرد تلقائياً.",
                 parse_mode=ParseMode.HTML, reply_markup=kb,
             )
             context.application.create_task(
                 _captcha_timeout(context, chat_id, member.id, sent.message_id)
             )
-        elif s.get("welcome"):
-            text = s.get("welcome_text") or None
-            if not text:
-                import random
-                text = random.choice(WELCOME_TEMPLATES)
-            await msg.reply_text(
-                text.format(name=member.mention_html()), parse_mode=ParseMode.HTML
+        except Exception:
+            pass
+    elif s.get("welcome"):
+        text = s.get("welcome_text") or None
+        if not text:
+            import random
+            text = random.choice(WELCOME_TEMPLATES)
+        try:
+            await context.bot.send_message(
+                chat_id, text.format(name=member.mention_html()), parse_mode=ParseMode.HTML
             )
+        except Exception:
+            pass
+
+
+def _joined(old_status, new_status):
+    """يحدّد إذا في انتقال حقيقي من (مش عضو) إلى (عضو)"""
+    was_member = old_status in (
+        ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER,
+    )
+    is_member = new_status in (
+        ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER,
+    )
+    return (not was_member) and is_member
+
+
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يلتقط انضمام أعضاء جدد بشكل مضمون (بديل أدق من رسالة 'فلان انضم')"""
+    cmu = update.chat_member
+    if not cmu:
+        return
+    member = cmu.new_chat_member.user
+    if member.id == context.bot.id:
+        return  # حالة البوت نفسه معالجة بـ on_my_chat_member
+    if not _joined(cmu.old_chat_member.status, cmu.new_chat_member.status):
+        return
+    await _greet_or_captcha(context, cmu.chat.id, member)
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يلتقط لما البوت نفسه ينضم/يترفّع أدمن بكروب"""
+    cmu = update.my_chat_member
+    if not cmu:
+        return
+    chat_id = cmu.chat.id
+    old_status = cmu.old_chat_member.status
+    new_status = cmu.new_chat_member.status
+
+    if _joined(old_status, new_status):
+        try:
+            await context.bot.send_message(
+                chat_id,
+                "🛡️ عشت، شكراً عالإضافة!\n"
+                "ارفعني <b>مشرف</b> بصلاحيات (حذف رسائل، حظر أعضاء) عشان أقدر أحميكم فعلياً.\n\n"
+                "اكتب /panel عشان تفتح لوحة الإعدادات.",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+
+    # نضبط قائمة الأوامر تظهر لمشرفي هالكروب بس (تتحدّث تلقائياً مع أي تغيير أدمن لاحقاً)
+    if new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+        try:
+            await context.bot.set_my_commands(
+                [
+                    BotCommand("panel", "لوحة تحكم الحماية"),
+                    BotCommand("ban", "حظر (بالرد)"),
+                    BotCommand("unban", "فك حظر <id>"),
+                    BotCommand("kick", "طرد (بالرد)"),
+                    BotCommand("mute", "كتم (بالرد) [دقايق]"),
+                    BotCommand("unmute", "فك كتم (بالرد)"),
+                    BotCommand("warn", "تحذير (بالرد)"),
+                    BotCommand("unwarn", "إنقاص تحذير (بالرد)"),
+                    BotCommand("allow", "استثناء من منع الروابط (بالرد)"),
+                    BotCommand("disallow", "إلغاء الاستثناء (بالرد)"),
+                ],
+                scope=BotCommandScopeChatAdministrators(chat_id=chat_id),
+            )
+        except Exception:
+            pass
 
 
 async def _captcha_timeout(context, chat_id, user_id, msg_id):
@@ -477,54 +577,65 @@ async def cmd_ban(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /ban")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /ban")
+        await _cleanup_command(context, msg, rec)
         return
     try:
         await context.bot.ban_chat_member(msg.chat_id, target.id)
-        await msg.reply_text(f"🚫 تم حظر {target.mention_html()}", parse_mode=ParseMode.HTML)
+        await _reply_hideable(context, msg.chat_id, rec, f"🚫 تم حظر {target.mention_html()}", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await msg.reply_text(f"ما قدرت: {e}")
+        await _reply_hideable(context, msg.chat_id, rec, f"ما قدرت: {e}")
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_unban(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     if not context.args:
-        await msg.reply_text("اكتب /unban <id>")
+        await _reply_hideable(context, msg.chat_id, rec, "اكتب /unban <id>")
+        await _cleanup_command(context, msg, rec)
         return
     try:
         await context.bot.unban_chat_member(msg.chat_id, int(context.args[0]))
-        await msg.reply_text("✅ تم فك الحظر.")
+        await _reply_hideable(context, msg.chat_id, rec, "✅ تم فك الحظر.")
     except Exception as e:
-        await msg.reply_text(f"ما قدرت: {e}")
+        await _reply_hideable(context, msg.chat_id, rec, f"ما قدرت: {e}")
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_kick(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /kick")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /kick")
+        await _cleanup_command(context, msg, rec)
         return
     try:
         await context.bot.ban_chat_member(msg.chat_id, target.id)
         await context.bot.unban_chat_member(msg.chat_id, target.id)
-        await msg.reply_text(f"👢 تم طرد {target.mention_html()}", parse_mode=ParseMode.HTML)
+        await _reply_hideable(context, msg.chat_id, rec, f"👢 تم طرد {target.mention_html()}", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await msg.reply_text(f"ما قدرت: {e}")
+        await _reply_hideable(context, msg.chat_id, rec, f"ما قدرت: {e}")
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_mute(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /mute [دقايق]")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /mute [دقايق]")
+        await _cleanup_command(context, msg, rec)
         return
     minutes = 15
     if context.args:
@@ -538,18 +649,21 @@ async def cmd_mute(update, context):
             permissions=ChatPermissions(can_send_messages=False),
             until_date=int(time.time()) + minutes * 60,
         )
-        await msg.reply_text(f"🔇 تم كتم {target.mention_html()} لمدة {minutes} دقيقة", parse_mode=ParseMode.HTML)
+        await _reply_hideable(context, msg.chat_id, rec, f"🔇 تم كتم {target.mention_html()} لمدة {minutes} دقيقة", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await msg.reply_text(f"ما قدرت: {e}")
+        await _reply_hideable(context, msg.chat_id, rec, f"ما قدرت: {e}")
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_unmute(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /unmute")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /unmute")
+        await _cleanup_command(context, msg, rec)
         return
     try:
         await context.bot.restrict_chat_member(
@@ -559,66 +673,80 @@ async def cmd_unmute(update, context):
                 can_send_videos=True, can_send_other_messages=True,
             ),
         )
-        await msg.reply_text(f"🔊 تم فك الكتم عن {target.mention_html()}", parse_mode=ParseMode.HTML)
+        await _reply_hideable(context, msg.chat_id, rec, f"🔊 تم فك الكتم عن {target.mention_html()}", parse_mode=ParseMode.HTML)
     except Exception as e:
-        await msg.reply_text(f"ما قدرت: {e}")
+        await _reply_hideable(context, msg.chat_id, rec, f"ما قدرت: {e}")
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_warn(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /warn")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /warn")
+        await _cleanup_command(context, msg, rec)
         return
     await _add_warn(context, msg.chat_id, target)
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_unwarn(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /unwarn")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /unwarn")
+        await _cleanup_command(context, msg, rec)
         return
-    rec = get_chat_rec(msg.chat_id)
     key = str(target.id)
     if rec["warns"].get(key, 0) > 0:
         rec["warns"][key] -= 1
         persist(msg.chat_id)
-    await msg.reply_text(f"↩️ تم إنقاص تحذير عن {target.mention_html()} ({rec['warns'].get(key,0)})", parse_mode=ParseMode.HTML)
+    await _reply_hideable(
+        context, msg.chat_id, rec,
+        f"↩️ تم إنقاص تحذير عن {target.mention_html()} ({rec['warns'].get(key,0)})",
+        parse_mode=ParseMode.HTML,
+    )
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_allow(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /allow")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /allow")
+        await _cleanup_command(context, msg, rec)
         return
-    rec = get_chat_rec(msg.chat_id)
     if target.id not in rec["whitelist"]:
         rec["whitelist"].append(target.id)
         persist(msg.chat_id)
-    await msg.reply_text(f"✅ {target.mention_html()} صار مسموحله يبعت روابط.", parse_mode=ParseMode.HTML)
+    await _reply_hideable(context, msg.chat_id, rec, f"✅ {target.mention_html()} صار مسموحله يبعت روابط.", parse_mode=ParseMode.HTML)
+    await _cleanup_command(context, msg, rec)
 
 
 async def cmd_disallow(update, context):
     msg = update.message
     if not await is_group_admin(context.bot, msg.chat_id, msg.from_user.id):
         return
+    rec = get_chat_rec(msg.chat_id)
     target = _reply_target(update)
     if not target:
-        await msg.reply_text("رد على رسالة الشخص واكتب /disallow")
+        await _reply_hideable(context, msg.chat_id, rec, "رد على رسالة الشخص واكتب /disallow")
+        await _cleanup_command(context, msg, rec)
         return
-    rec = get_chat_rec(msg.chat_id)
     if target.id in rec["whitelist"]:
         rec["whitelist"].remove(target.id)
         persist(msg.chat_id)
-    await msg.reply_text("✅ تم إلغاء الاستثناء.")
+    await _reply_hideable(context, msg.chat_id, rec, "✅ تم إلغاء الاستثناء.")
+    await _cleanup_command(context, msg, rec)
 
 
 # ==================================================================
@@ -633,7 +761,10 @@ async def cmd_panel(update, context):
         await msg.reply_text("❌ بس مشرفين الكروب يقدروا يفتحوا اللوحة.")
         return
     rec = get_chat_rec(msg.chat_id)
-    await msg.reply_text(panel_text(rec), parse_mode=ParseMode.HTML, reply_markup=panel_kb(rec))
+    await _delete_silent(context.bot, msg.chat_id, msg.message_id)
+    await context.bot.send_message(
+        msg.chat_id, panel_text(rec), parse_mode=ParseMode.HTML, reply_markup=panel_kb(rec)
+    )
 
 
 async def panel_cb(update, context):
@@ -652,6 +783,7 @@ async def panel_cb(update, context):
         "g_spam": "anti_spam",
         "g_welcome": "welcome",
         "g_captcha": "captcha",
+        "g_clean": "clean_mode",
     }
     if data in toggles:
         key = toggles[data]
@@ -671,6 +803,11 @@ async def panel_cb(update, context):
     if data == "g_refresh":
         await q.answer()
         await q.edit_message_text(panel_text(rec), parse_mode=ParseMode.HTML, reply_markup=panel_kb(rec))
+        return
+
+    if data == "g_close":
+        await q.answer()
+        await _delete_silent(context.bot, chat_id, q.message.message_id)
         return
 
 
@@ -712,7 +849,8 @@ def build_app():
     app.add_handler(CallbackQueryHandler(panel_cb, pattern="^g_"))
     app.add_handler(CallbackQueryHandler(captcha_cb, pattern="^cap:"))
 
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
+    app.add_handler(ChatMemberHandler(on_my_chat_member, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_chat_member_update, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(
         MessageHandler(filters.ALL & filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, group_protection)
     )
@@ -730,8 +868,13 @@ async def _run_async():
     app = build_app()
     await app.initialize()
     await app.start()
-    # stop_signals=None يمنع مشاكل معالجة إشارات النظام جوا حاويات مثل Render
-    await app.updater.start_polling(drop_pending_updates=True)
+    # لازم نطلب Update.ALL_TYPES صراحة، وإلا تحديثات chat_member/my_chat_member ما توصل
+    await app.updater.start_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    # نخفي قائمة الأوامر افتراضياً (بتظهر بس لمشرفي كل كروب — انضبط تلقائياً عبر my_chat_member)
+    try:
+        await app.bot.set_my_commands([], scope=BotCommandScopeDefault())
+    except Exception:
+        pass
     log.info("🛡️ بوت الحماية شغّال...")
 
     stop_event = asyncio.Event()
