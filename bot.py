@@ -463,8 +463,19 @@ async def captcha_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
     await q.answer("تم التحقق ✅")
+
+    # نطلع رسالة ترحيب عشوائية (نفس منطق الترحيب العادي)
+    rec = get_chat_rec(chat_id)
+    s = rec["settings"]
+    text = s.get("welcome_text") or None
+    if not text:
+        import random
+        text = random.choice(WELCOME_TEMPLATES)
     try:
-        await q.edit_message_text(f"✅ تم التحقق، أهلاً فيك!")
+        await q.edit_message_text(
+            f"✅ تم التحقق!\n\n{text.format(name=q.from_user.mention_html())}",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception:
         pass
 
