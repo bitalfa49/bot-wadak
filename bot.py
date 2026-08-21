@@ -321,10 +321,24 @@ def panel_text(rec):
 #                    الترحيب + الكابتشا
 # ==================================================================
 PENDING_CAPTCHA = {}   # (chat_id, user_id) -> True
+_RECENTLY_GREETED = {}  # (chat_id, user_id) -> expiry_ts — يمنع تكرار الترحيب لو انفعل حدثين لنفس الانضمام
+
+
+def _already_greeted(chat_id, user_id):
+    """يمنع الترحيب المزدوج لو وصل حدث الانضمام من مصدرين (رسالة + chat_member)"""
+    key = (chat_id, user_id)
+    now = time.time()
+    exp = _RECENTLY_GREETED.get(key)
+    if exp and exp > now:
+        return True
+    _RECENTLY_GREETED[key] = now + 30
+    return False
 
 
 async def _greet_or_captcha(context, chat_id, member):
-    """يرحّب بعضو جديد أو يفعّل الكابتشا له — يُستدعى من ChatMemberHandler (أدق من رسائل الانضمام)"""
+    """يرحّب بعضو جديد أو يفعّل الكابتشا له"""
+    if _already_greeted(chat_id, member.id):
+        return
     rec = get_chat_rec(chat_id)
     s = rec["settings"]
 
@@ -376,7 +390,7 @@ def _joined(old_status, new_status):
 
 
 async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يلتقط انضمام أعضاء جدد بشكل مضمون (بديل أدق من رسالة 'فلان انضم')"""
+    """يلتقط انضمام أعضاء جدد — يحتاج البوت يكون أدمن بالكروب"""
     cmu = update.chat_member
     if not cmu:
         return
@@ -386,6 +400,23 @@ async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TY
     if not _joined(cmu.old_chat_member.status, cmu.new_chat_member.status):
         return
     await _greet_or_captcha(context, cmu.chat.id, member)
+
+
+async def on_new_member_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """احتياطي: يلتقط الانضمام من رسالة الخدمة نفسها — يشتغل حتى لو البوت لسا مش أدمن"""
+    msg = update.message
+    if not msg or not msg.new_chat_members:
+        return
+    chat_id = msg.chat_id
+    for member in msg.new_chat_members:
+        if member.id == context.bot.id:
+            continue
+        await _greet_or_captcha(context, chat_id, member)
+
+
+async def cmd_ping(update, context):
+    """أمر تشخيص سريع — يتأكد إنو البوت شغّال ووصل النشر الأخير"""
+    await update.message.reply_text("🏓 pong — البوت شغّال ووصل آخر نسخة.")
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -846,6 +877,7 @@ def start_web_server():
 def build_app():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    app.add_handler(CommandHandler("ping", cmd_ping))
     app.add_handler(CommandHandler("panel", cmd_panel))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
@@ -862,6 +894,8 @@ def build_app():
 
     app.add_handler(ChatMemberHandler(on_my_chat_member, chat_member_types=ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(ChatMemberHandler(on_chat_member_update, chat_member_types=ChatMemberHandler.CHAT_MEMBER))
+    # احتياطي يشتغل حتى لو تحديثات chat_member ما وصلت لأي سبب
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member_message))
     app.add_handler(
         MessageHandler(filters.ALL & filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, group_protection)
     )
